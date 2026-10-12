@@ -18,7 +18,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["8697870049:AAFMk3hOW0QE3xaq9bafIpUyMGCSAxvEdFM"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 # کانال‌های اسپانسر، مثلا: @sponsor1,@sponsor2
 SPONSOR_CHANNELS = [c.strip() for c in os.getenv("SPONSOR_CHANNELS", "").split(",") if c.strip()]
