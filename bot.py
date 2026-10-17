@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import secrets
@@ -19,11 +20,26 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+def parse_admin_ids(raw: str) -> set[int]:
+    ids = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        if not x.lstrip("-").isdigit():
+            raise SystemExit(f"ADMIN_IDS باید آیدی عددی باشد، نه '{x}'. آیدی را از @userinfobot بگیرید.")
+        ids.add(int(x))
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+if not ADMIN_IDS:
+    raise SystemExit("ADMIN_IDS خالی است. حداقل یک آیدی عددی ادمین در .env بگذارید.")
 # کانال‌های اسپانسر، مثلا: @sponsor1,@sponsor2
 SPONSOR_CHANNELS = [c.strip() for c in os.getenv("SPONSOR_CHANNELS", "").split(",") if c.strip()]
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "1") == "1"  # جلوگیری از فوروارد/ذخیره
+DELETE_AFTER = int(os.getenv("DELETE_AFTER", "45"))  # ثانیه تا حذف خودکار ویدیو
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("movie_bot")
@@ -118,13 +134,47 @@ async def deliver_video(bot, chat_id: int, code: str):
     if not video:
         await bot.send_message(chat_id, "❌ این ویدیو پیدا نشد یا حذف شده است.")
         return
-    await bot.send_video(
+    sent = await bot.send_video(
         chat_id=chat_id,
         video=video["file_id"],
         caption=video["caption"] or None,
         protect_content=PROTECT_CONTENT,
     )
     inc_downloads(code)
+
+    hint = (
+        "ویدیو را همین الان ببینید."
+        if PROTECT_CONTENT
+        else "اگر می‌خواهید نگهش دارید، همین الان ذخیره یا فوروارد کنید."
+    )
+    warning = await bot.send_message(
+        chat_id,
+        f"⚠️ اخطار: این ویدیو بعد از {DELETE_AFTER} ثانیه به‌طور خودکار پاک می‌شود.\n{hint}",
+    )
+
+    # حذف زمان‌بندی‌شده؛ مرجع تسک نگه داشته می‌شود تا garbage collect نشود
+    task = asyncio.create_task(delete_later(bot, chat_id, sent.message_id, warning.message_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+_bg_tasks: set = set()
+
+
+async def delete_later(bot, chat_id: int, video_msg_id: int, warning_msg_id: int):
+    await asyncio.sleep(DELETE_AFTER)
+    try:
+        await bot.delete_message(chat_id, video_msg_id)
+    except TelegramError as e:
+        log.warning("Could not delete video message: %s", e)
+    try:
+        await bot.edit_message_text(
+            "⏰ ویدیو پاک شد. برای دریافت دوباره، روی لینک داخل کانال اصلی کلیک کنید.",
+            chat_id=chat_id,
+            message_id=warning_msg_id,
+        )
+    except TelegramError as e:
+        log.warning("Could not edit warning message: %s", e)
 
 
 # --------------------------- Handlers -----------------------------
@@ -174,12 +224,22 @@ async def check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ادمین ویدیو را برای ربات می‌فرستد و لینک اختصاصی می‌گیرد."""
     msg = update.message
+    # بررسی دوم: فقط ادمین‌ها اجازه ذخیره ویدیو دارند
+    if update.effective_user.id not in ADMIN_IDS:
+        await msg.reply_text("⛔ فقط ادمین می‌تواند ویدیو اضافه کند.")
+        return
     media = msg.video or msg.document
     code = add_video(media.file_id, msg.caption or "")
     link = f"https://t.me/{context.bot.username}?start={code}"
     await msg.reply_text(
         f"✅ ویدیو ذخیره شد.\n\nلینک برای گذاشتن در کانال اصلی:\n{link}",
         disable_web_page_preview=True,
+    )
+
+
+async def non_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "برای دریافت فیلم، روی لینک داخل کانال اصلی کلیک کنید 🎬"
     )
 
 
@@ -215,7 +275,10 @@ def main():
     app.add_handler(CallbackQueryHandler(check_callback, pattern=r"^check:"))
     app.add_handler(CommandHandler("stats", stats, filters=admin_filter))
     app.add_handler(CommandHandler("list", list_videos, filters=admin_filter))
-    app.add_handler(MessageHandler(admin_filter & (filters.VIDEO | filters.Document.VIDEO), admin_video))
+    media_filter = filters.VIDEO | filters.Document.VIDEO
+    app.add_handler(MessageHandler(admin_filter & media_filter, admin_video))
+    # هر کاربر غیرادمین که ویدیو بفرستد این پیام را می‌گیرد و چیزی ذخیره نمی‌شود
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & media_filter, non_admin_media))
 
     log.info("Bot started. Sponsors: %s", SPONSOR_CHANNELS)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
